@@ -38,6 +38,7 @@ public sealed class ShareSubmissionService
     private readonly TvMazeClient _tvMazeClient;
     private readonly ILogger<ShareSubmissionService> _logger;
     private readonly string _introSkipperDbPath;
+    private readonly string _legacyIntroSkipperDbPath;
 
     /// <summary>Initializes a new instance of the <see cref="ShareSubmissionService"/> class.</summary>
     /// <param name="libraryManager">Jellyfin library manager.</param>
@@ -59,7 +60,9 @@ public sealed class ShareSubmissionService
         _httpClientFactory = httpClientFactory;
         _tvMazeClient = tvMazeClient;
         _logger = logger;
-        _introSkipperDbPath = Path.Join(applicationPaths.DataPath, "introskipper", "introskipper.db");
+        // Intro Skipper keeps the legacy database after migrating, so the v2 file wins when both exist.
+        _introSkipperDbPath = Path.Join(applicationPaths.DataPath, "introskipper", "introskipper-v2.db");
+        _legacyIntroSkipperDbPath = Path.Join(applicationPaths.DataPath, "introskipper", "introskipper.db");
     }
 
     /// <summary>Shares selected movies, episodes, and seasons.</summary>
@@ -211,7 +214,7 @@ public sealed class ShareSubmissionService
     /// <returns>Counts of shareable timestamps.</returns>
     public IReadOnlyDictionary<Guid, int> GetShareableSegmentCountsByItemId()
     {
-        if (!File.Exists(_introSkipperDbPath))
+        if (ResolveIntroSkipperDbPath() is null)
         {
             return new Dictionary<Guid, int>();
         }
@@ -635,45 +638,74 @@ public sealed class ShareSubmissionService
         };
     }
 
+    private string? ResolveIntroSkipperDbPath()
+    {
+        if (File.Exists(_introSkipperDbPath))
+        {
+            return _introSkipperDbPath;
+        }
+
+        return File.Exists(_legacyIntroSkipperDbPath) ? _legacyIntroSkipperDbPath : null;
+    }
+
     [SuppressMessage("Security", "CA2100:Review SQL queries for security vulnerabilities", Justification = "IN-clause placeholders are generated internally and each value is parameterized.")]
     private Dictionary<Guid, IReadOnlyDictionary<string, SegmentRange>> LoadIntroSkipperSegments(List<Guid> itemIds)
     {
-        if (itemIds.Count == 0 || !File.Exists(_introSkipperDbPath))
+        var dbPath = ResolveIntroSkipperDbPath();
+        if (itemIds.Count == 0 || dbPath is null)
         {
             return [];
         }
 
         var connectionString = new SqliteConnectionStringBuilder
         {
-            DataSource = _introSkipperDbPath,
+            DataSource = dbPath,
             Mode = SqliteOpenMode.ReadOnly,
         }.ToString();
 
         using var connection = new SqliteConnection(connectionString);
         connection.Open();
 
-        // Support databases from before provenance tracking was added.
-        using var checkCol = connection.CreateCommand();
-        checkCol.CommandText = "SELECT COUNT(*) FROM pragma_table_info('DbSegment') WHERE name = 'IsUserProvided'";
-        var hasIsUserProvided = (long)(checkCol.ExecuteScalar() ?? 0L) > 0;
+        bool hasIsUserProvided;
+        bool hasSource;
+        string selectFields;
+        string fromClause;
+        if (dbPath == _introSkipperDbPath)
+        {
+            // Intro Skipper v2 stores ticks, records segment-editor entries as
+            // SegmentSource.User (5), and keeps suppressed segments (State 1).
+            hasIsUserProvided = true;
+            hasSource = true;
+            selectFields = "ItemId, Type, StartTicks / 10000000.0, EndTicks / 10000000.0, Source = 5, Source";
+            fromClause = "Segments WHERE State = 0 AND";
+        }
+        else
+        {
+            // Support databases from before provenance tracking was added.
+            using var checkCol = connection.CreateCommand();
+            checkCol.CommandText = "SELECT COUNT(*) FROM pragma_table_info('DbSegment') WHERE name = 'IsUserProvided'";
+            hasIsUserProvided = (long)(checkCol.ExecuteScalar() ?? 0L) > 0;
 
-        using var sourceCheck = connection.CreateCommand();
-        sourceCheck.CommandText = "SELECT COUNT(*) FROM pragma_table_info('DbSegment') WHERE name = 'Source'";
-        var hasSource = (long)(sourceCheck.ExecuteScalar() ?? 0L) > 0;
+            using var sourceCheck = connection.CreateCommand();
+            sourceCheck.CommandText = "SELECT COUNT(*) FROM pragma_table_info('DbSegment') WHERE name = 'Source'";
+            hasSource = (long)(sourceCheck.ExecuteScalar() ?? 0L) > 0;
+
+            selectFields = "ItemId, Type, Start, End";
+            if (hasIsUserProvided)
+            {
+                selectFields += ", IsUserProvided";
+            }
+
+            if (hasSource)
+            {
+                selectFields += ", Source";
+            }
+
+            fromClause = "DbSegment WHERE";
+        }
 
         // Track each range and its source.
         var tracking = new Dictionary<Guid, Dictionary<string, (SegmentRange Range, bool IsUserProvided)>>();
-
-        var selectFields = "ItemId, Type, Start, End";
-        if (hasIsUserProvided)
-        {
-            selectFields += ", IsUserProvided";
-        }
-
-        if (hasSource)
-        {
-            selectFields += ", Source";
-        }
 
         const int chunkSize = 400;
         for (var offset = 0; offset < itemIds.Count; offset += chunkSize)
@@ -695,8 +727,7 @@ public sealed class ShareSubmissionService
 
             command.CommandText = $"""
                 SELECT {selectFields}
-                FROM DbSegment
-                WHERE Type IN (0, 1, 2, 3)
+                FROM {fromClause} Type IN (0, 1, 2, 3)
                   AND ItemId COLLATE NOCASE IN ({string.Join(",", placeholders)})
                 """;
 
