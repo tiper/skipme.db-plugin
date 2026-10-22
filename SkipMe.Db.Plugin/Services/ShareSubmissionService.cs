@@ -638,9 +638,33 @@ public sealed class ShareSubmissionService
         };
     }
 
+    private static SqliteConnection OpenReadOnly(string dbPath)
+    {
+        var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Mode = SqliteOpenMode.ReadOnly,
+        }.ToString());
+        connection.Open();
+        return connection;
+    }
+
+    private static bool HasV2SegmentsSchema(string dbPath)
+    {
+        using var connection = OpenReadOnly(dbPath);
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT COUNT(*) FROM pragma_table_info('Segments')
+            WHERE name IN ('ItemId', 'Type', 'StartTicks', 'EndTicks', 'Source', 'State')
+            """;
+        return (long)(command.ExecuteScalar() ?? 0L) == 6;
+    }
+
     private string? ResolveIntroSkipperDbPath()
     {
-        if (File.Exists(_introSkipperDbPath))
+        // Fall back to the legacy database while the v2 file is missing, still being
+        // migrated, or from a schema revision this plugin does not understand.
+        if (File.Exists(_introSkipperDbPath) && HasV2SegmentsSchema(_introSkipperDbPath))
         {
             return _introSkipperDbPath;
         }
@@ -657,14 +681,7 @@ public sealed class ShareSubmissionService
             return [];
         }
 
-        var connectionString = new SqliteConnectionStringBuilder
-        {
-            DataSource = dbPath,
-            Mode = SqliteOpenMode.ReadOnly,
-        }.ToString();
-
-        using var connection = new SqliteConnection(connectionString);
-        connection.Open();
+        using var connection = OpenReadOnly(dbPath);
 
         bool hasIsUserProvided;
         bool hasSource;
